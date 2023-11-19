@@ -119,7 +119,7 @@ def result_exists(results, context_length, depth_percent, version, model):
         depth_percent_met = result['depth_percent'] == depth_percent
         version_met = result.get('version', 1) == version
         model_met = result['model'] == model
-        conditions_met.append(context_length_met and depth_percent_met and version_met)
+        conditions_met.append(context_length_met and depth_percent_met and version_met and model_met)
     return any(conditions_met)
 
 if __name__ == "__main__":
