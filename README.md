@@ -23,3 +23,19 @@ The key pieces:
 ## Results Visualization
 ![alt text](ResultsVisualization.png "Title")
 (Made via pivoting the results, averaging the multiple runs, and adding labels in google slides)
+
+## Reproduction (2023/11/21)
+### Original dataset
+A single re-run of this needle in the Haystack tests on the original data is:
+![alt text](new_results/05_full_128k_unshuffled_run/result_plot.png "")
+
+### File order reshuffled in dataset
+In the Twitter feed it was suggested that the issue may be caused by unlucky placement of the needle inside the dataset, and perhaps it could be interesting to run the same test on a dataset where the input files are loaded and concatenated in a different order.
+
+This repo contributes just this, and the result.json files for a single run.
+
+The low scores are still within the first 50%, and it may seem that there are fewer such cases, but this may be caused by the fact that this plot only has a single run. 2x or more runs may result in the needle being missing at other locations.
+
+
+
+![alt text](new_results/04_full_128k_reshuffled_files/result_plot.png "" )
