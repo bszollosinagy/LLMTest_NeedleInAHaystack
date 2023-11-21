@@ -9,12 +9,25 @@ from langchain.schema import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 import numpy as np
 import time
+import random
 
 load_dotenv()
 
-def read_files(directory):
+def read_files(directory, reshuffle_dataset=False):
+    """
+    :param directory: a directory with text files
+    :param reshuffle_dataset: Reshuffle the order of the files when loading. The random seed is fixed so that all needle searches are done on the same dataset.
+    :return: the entire text corpus as a string
+    """
     context = ""
-    for file in glob.glob(directory):
+    file_list = list(glob.glob(directory))
+
+    if reshuffle_dataset:
+        randomseed = 'The quick brown fox'
+        rnd = random.Random(x=randomseed)
+        rnd.shuffle(file_list)
+
+    for file in file_list:
         with open(file, 'r') as f:
             context += f.read()
     return context
@@ -62,12 +75,12 @@ def insert_needle(needle, context, depth_percent, context_length, enc):
     new_context = enc.decode(tokens_new_context)
     return new_context
 
-def generate_context(needle, context_length, depth_percent):
+def generate_context(needle, context_length, depth_percent, reshuffle_dataset=False):
     # Load up tiktoken so we navigate tokens more easily
     enc = tiktoken.encoding_for_model("gpt-4-1106-preview")
 
     # Get your Paul Graham files loaded into a string
-    context = read_files("paulgrahamessays/*.txt")
+    context = read_files("paulgrahamessays/*.txt", reshuffle_dataset=reshuffle_dataset)
 
     # Truncate the Paul Graham essays to the context length you desire
     context = encode_and_trim(context, context_length, enc)
@@ -122,7 +135,7 @@ def result_exists(results, context_length, depth_percent, version, model):
         conditions_met.append(context_length_met and depth_percent_met and version_met and model_met)
     return any(conditions_met)
 
-if __name__ == "__main__":
+def main():
     needle = """
     The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.
     """
@@ -141,13 +154,29 @@ if __name__ == "__main__":
     document_depth_percents = np.round(np.linspace(0, 100, num=15, endpoint=True)).astype(int)
 
     # The model we are testing. As of now it's set up for chat models with OpenAI
-    # model_to_test = ChatOpenAI(model='gpt-4-1106-preview', temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
-    model_to_test = ChatAnthropic(model='claude-2', temperature=0, anthropic_api_key = os.getenv('ANTHROPIC_API_KEY', 'YourAPIKey'))
+    model_to_test = ChatOpenAI(model='gpt-4-1106-preview', temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
+    # model_to_test = ChatAnthropic(model='claude-2', temperature=0, anthropic_api_key = os.getenv('ANTHROPIC_API_KEY', 'YourAPIKey'))
 
     # This will get logged on your results
-    model_to_test_description = 'claude-2'
+    model_to_test_description = model_to_test.model_name
 
-    evaluation_model  = ChatOpenAI(model="gpt-4", temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
+    # Use GPT4 Turbo because the eval itself is not too complicated
+    evaluation_model  = ChatOpenAI(model="gpt-4-1106-preview", temperature=0, openai_api_key = os.getenv('OPENAI_API_KEY', 'YourAPIKey'))
+
+    # Reshuffle files when loading (but keep content inside the files as they are)
+    reshuffle_dataset = False
+
+    # What method to use for respecting the rate limiter
+    time_based_rate_limiter = True
+
+    # Rate limits for your Tier
+    # Requests per Minute
+    RPM = 500
+    # Tokens per minute
+    TPM = 280000
+    verbose_rate_limiter = True
+
+
 
     # Run through each iteration of context_lengths and depths
     for context_length in context_lengths:
@@ -166,7 +195,7 @@ if __name__ == "__main__":
                 continue
 
             # Go generate the required length context and place your needle statement in
-            context = generate_context(needle, context_length, depth_percent)
+            context = generate_context(needle, context_length, depth_percent, reshuffle_dataset=reshuffle_dataset)
 
             # Prepare your message to send to the model you're going to evaluate
             messages = [
@@ -184,6 +213,7 @@ if __name__ == "__main__":
                 ),
             ]
 
+            rate_limiter_start = time.time()
             # Go see if the model can answer the question to pull out your random fact
             response = model_to_test(messages)
 
@@ -212,7 +242,68 @@ if __name__ == "__main__":
                 json.dump(results, f)
 
             # Optional. Sleep for a bit to stay under the rate limit
-            # Rate limit is 150K tokens/min so it's set at 120K for some cushion
-            sleep_time = (context_length / 120000)*60
-            # print (f"Sleeping: {sleep_time}\n")
+            rate_limiter_current = time.time()
+            sleep_time = wait_to_respect_rate_limiting(RPM, TPM, context_length,
+                                                       rate_limiter_current,
+                                                       rate_limiter_start,
+                                                       time_based_rate_limiter,
+                                                       verbose_rate_limiter)
+
+            if verbose_rate_limiter:
+                print(f'Pausing to respect rate limiting: {sleep_time}')
             time.sleep(sleep_time)
+            if verbose_rate_limiter:
+                print('Resuming\n')
+
+
+def wait_to_respect_rate_limiting(RPM, TPM, context_length,
+                                  rate_limiter_current, rate_limiter_start,
+                                  time_based_rate_limiter,
+                                  verbose_rate_limiter):
+    """
+    Waits some time based on the number of tokens used during the API call and the rate limits.
+    If "time_based_rate_limiter" is True, then time already spent while performing the API call is also taken into account.
+
+    :param RPM: Requests per Minute
+    :param TPM: Tokens per Minute
+    :param context_length: the number of tokens used up during the API call
+    :param rate_limiter_current: time now
+    :param rate_limiter_start: time when starting the API call
+    :param time_based_rate_limiter: boolean to choose wether to subract the time spent in the API call
+    :param verbose_rate_limiter:
+    :return:
+    """
+    if time_based_rate_limiter:
+        need_to_spend_this_amount_of_seconds_to_respect_RPM = 60 / RPM
+        need_to_spend_this_amount_of_seconds_to_respect_TPM = 60 * (
+                    context_length / TPM)
+
+        time_used_by_api_call = rate_limiter_current - rate_limiter_start
+
+        # If appropriate, subtract the time already spent in the API call
+        if time_used_by_api_call < need_to_spend_this_amount_of_seconds_to_respect_RPM:
+            pause_tgt_rpm = np.ceil(
+                need_to_spend_this_amount_of_seconds_to_respect_RPM - time_used_by_api_call)
+        else:
+            pause_tgt_rpm = 0.0
+
+        if time_used_by_api_call < need_to_spend_this_amount_of_seconds_to_respect_TPM:
+            pause_tgt_tpm = np.ceil(
+                need_to_spend_this_amount_of_seconds_to_respect_TPM - time_used_by_api_call)
+        else:
+            pause_tgt_tpm = 0.0
+
+        sleep_time = max(pause_tgt_rpm, pause_tgt_tpm)
+        if verbose_rate_limiter:
+            print(
+                f'RPM pause: {pause_tgt_rpm}   |   TPM pause: {pause_tgt_tpm}   | original approx pause: {need_to_spend_this_amount_of_seconds_to_respect_TPM}')
+
+    else:
+        # Rate limit is 150K tokens/min so it's set at 120K for some cushion
+        token_per_minute_limit = TPM
+        sleep_time = (context_length / token_per_minute_limit) * 60
+    return sleep_time
+
+
+if __name__ == "__main__":
+    main()
